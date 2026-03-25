@@ -30,6 +30,7 @@ const zipInput = document.getElementById('zipInput');
 const serviceNameInput = document.getElementById('serviceNameInput');
 const serviceNameRow = document.getElementById('serviceNameRow');
 const hoursInput = document.getElementById('hoursInput');
+const phoneInput = document.getElementById('phoneInput');
 const pageTypeButtons = document.getElementById('pageTypeButtons');
 const autoDetectBadge = document.getElementById('autoDetectBadge');
 
@@ -311,6 +312,7 @@ function detectPageType(url) {
   try {
     const path = new URL(url).pathname.toLowerCase().replace(/\/$/, '');
     if (!path || path === '' || path === '/') return 'homepage';
+    if (/\/(blog|news|article|post|journal|tips)\b/.test(path)) return 'blog';
     if (/\/(about|team|our-team|meet-the-doctor|meet-the-team|our-dentist|staff|providers|doctors?)\b/.test(path)) return 'about';
     if (/\/(contact|location|directions|find-us|office-location|hours|get-in-touch|appointment|schedule)\b/.test(path)) return 'contact';
     return 'service'; // Any other inner page defaults to service
@@ -374,6 +376,12 @@ async function handleAnalyze() {
     if (hoursOverride) {
       const parsed = parseHoursText(hoursOverride);
       if (parsed.length > 0) entities.hours = parsed;
+    }
+
+    // Phone override
+    const phoneOverride = phoneInput.value.trim();
+    if (phoneOverride) {
+      entities.practice.phone = phoneOverride;
     }
 
     // Auto-detect if not manually set
@@ -566,12 +574,22 @@ function extractDentalEntities(html, pageUrl) {
   // --- Individual Reviews ---
   const reviews = extractReviews(doc, flatSchemas);
 
+  // --- Videos ---
+  const videos = extractVideos(doc, flatSchemas, domain);
+
+  // --- Article / Blog Post Data ---
+  const articleData = extractArticleData(doc, flatSchemas, bodyText);
+
+  // --- HowTo Steps ---
+  const howToSteps = extractHowToSteps(doc);
+
   return {
     pageUrl, domain, h1, h2s, practiceName, doctors, dates, description, image,
     practice, specialties, services, faqs, amenities, languages, payment,
     acceptingPatients, hours, hasEmergency, hasBeforeAfter, externalLinks,
     lastReviewed, answerText, bodyText, wordCount, lang, memberships, priceRange,
-    aggregateRating, reviews, existingSchemas: flatSchemas
+    aggregateRating, reviews, videos, articleData, howToSteps,
+    existingSchemas: flatSchemas
   };
 }
 
@@ -1200,6 +1218,184 @@ function extractAnswerText(doc) {
     .slice(0, 3).join(' ').slice(0, 500);
 }
 
+// --- Video Extraction ---
+function extractVideos(doc, schemas, domain) {
+  const videos = [];
+  const seen = new Set();
+
+  // 1. Existing VideoObject in JSON-LD
+  for (const s of schemas) {
+    if (s['@type'] === 'VideoObject' && s.name) {
+      const key = s.contentUrl || s.embedUrl || s.name;
+      if (!seen.has(key)) {
+        seen.add(key);
+        videos.push({
+          name: s.name,
+          description: s.description || '',
+          thumbnailUrl: s.thumbnailUrl || '',
+          contentUrl: s.contentUrl || '',
+          embedUrl: s.embedUrl || '',
+          uploadDate: s.uploadDate || '',
+          duration: s.duration || ''
+        });
+      }
+    }
+  }
+
+  // 2. YouTube iframes
+  doc.querySelectorAll('iframe[src*="youtube.com"], iframe[src*="youtu.be"], iframe[data-src*="youtube.com"]').forEach(iframe => {
+    const src = iframe.src || iframe.dataset.src || '';
+    const match = src.match(/(?:embed\/|v\/|v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+    if (match && !seen.has(match[1])) {
+      seen.add(match[1]);
+      const videoId = match[1];
+      const title = iframe.getAttribute('title') || iframe.getAttribute('aria-label') || 'Video';
+      videos.push({
+        name: title,
+        description: '',
+        thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+        contentUrl: `https://www.youtube.com/watch?v=${videoId}`,
+        embedUrl: `https://www.youtube.com/embed/${videoId}`,
+        uploadDate: '',
+        duration: ''
+      });
+    }
+  });
+
+  // 3. Vimeo iframes
+  doc.querySelectorAll('iframe[src*="vimeo.com"], iframe[data-src*="vimeo.com"]').forEach(iframe => {
+    const src = iframe.src || iframe.dataset.src || '';
+    const match = src.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+    if (match && !seen.has(match[1])) {
+      seen.add(match[1]);
+      const title = iframe.getAttribute('title') || iframe.getAttribute('aria-label') || 'Video';
+      videos.push({
+        name: title,
+        description: '',
+        thumbnailUrl: '',
+        contentUrl: `https://vimeo.com/${match[1]}`,
+        embedUrl: `https://player.vimeo.com/video/${match[1]}`,
+        uploadDate: '',
+        duration: ''
+      });
+    }
+  });
+
+  // 4. HTML5 <video> elements
+  doc.querySelectorAll('video').forEach(vid => {
+    const src = vid.src || vid.querySelector('source')?.src || '';
+    if (src && !seen.has(src)) {
+      seen.add(src);
+      const resolvedSrc = src.startsWith('http') ? src : domain + (src.startsWith('/') ? '' : '/') + src;
+      videos.push({
+        name: vid.getAttribute('title') || vid.getAttribute('aria-label') || 'Video',
+        description: '',
+        thumbnailUrl: vid.poster || '',
+        contentUrl: resolvedSrc,
+        embedUrl: '',
+        uploadDate: '',
+        duration: ''
+      });
+    }
+  });
+
+  return videos.slice(0, 5);
+}
+
+// --- Article / Blog Post Data Extraction ---
+function extractArticleData(doc, schemas, bodyText) {
+  // 1. Check existing Article/BlogPosting schema
+  for (const s of schemas) {
+    if (s['@type'] === 'Article' || s['@type'] === 'BlogPosting' || s['@type'] === 'NewsArticle') {
+      return {
+        type: s['@type'],
+        headline: s.headline || s.name || '',
+        author: typeof s.author === 'string' ? s.author : (s.author?.name || ''),
+        datePublished: s.datePublished || '',
+        dateModified: s.dateModified || '',
+        wordCount: s.wordCount || 0,
+        articleBody: (s.articleBody || '').slice(0, 500)
+      };
+    }
+  }
+
+  // 2. Detect from DOM structure
+  const article = doc.querySelector('article');
+  if (!article) return null;
+
+  const headline = article.querySelector('h1, h2')?.textContent?.trim() || '';
+  if (!headline) return null;
+
+  // Author detection
+  let author = '';
+  const authorEl = doc.querySelector('[rel="author"], .author, .byline, [class*="author"], [itemprop="author"]');
+  if (authorEl) author = authorEl.textContent.trim().replace(/^by\s+/i, '');
+
+  // Date detection
+  const timeEl = article.querySelector('time[datetime]') || doc.querySelector('time[datetime]');
+  const datePublished = timeEl?.getAttribute('datetime') || '';
+
+  // Word count from article body
+  const articleText = article.textContent || '';
+  const wc = articleText.split(/\s+/).filter(Boolean).length;
+
+  return {
+    type: 'BlogPosting',
+    headline,
+    author,
+    datePublished,
+    dateModified: '',
+    wordCount: wc,
+    articleBody: articleText.trim().slice(0, 500)
+  };
+}
+
+// --- HowTo Steps Extraction ---
+function extractHowToSteps(doc) {
+  const steps = [];
+  // Look for ordered lists inside main content areas
+  const main = doc.querySelector('article') || doc.querySelector('[role="main"]') || doc.querySelector('main') || doc.body;
+  if (!main) return steps;
+
+  const orderedLists = main.querySelectorAll('ol');
+  for (const ol of orderedLists) {
+    // Skip navigational/junk lists
+    const parent = ol.parentElement;
+    if (parent && /nav|footer|sidebar|menu|breadcrumb|toc|table-of-contents/i.test(parent.className + ' ' + (parent.id || ''))) continue;
+
+    const items = ol.querySelectorAll(':scope > li');
+    if (items.length < 2 || items.length > 20) continue;
+
+    // Check if the content near this list is procedural (dental/medical)
+    const prevEl = ol.previousElementSibling;
+    const contextText = (prevEl?.textContent || '') + ' ' + ol.textContent;
+    const isProcedural = /step|process|procedure|how|treatment|method|first|then|next|prepare|place|apply|clean|exam|numb|anesthet/i.test(contextText);
+    if (!isProcedural) continue;
+
+    items.forEach((li, i) => {
+      const text = li.textContent.trim();
+      if (text.length > 10 && text.length < 500) {
+        // Try to separate step name from description
+        const colonSplit = text.match(/^([^:]{5,60}):\s*(.+)$/s);
+        if (colonSplit) {
+          steps.push({ position: i + 1, name: colonSplit[1].trim(), text: colonSplit[2].trim() });
+        } else {
+          const firstSentence = text.match(/^([^.!?]{10,80}[.!?])/);
+          steps.push({
+            position: i + 1,
+            name: firstSentence ? firstSentence[1] : text.slice(0, 80),
+            text: text
+          });
+        }
+      }
+    });
+
+    if (steps.length >= 2) break; // Use first valid procedural list
+  }
+
+  return steps.slice(0, 10);
+}
+
 // --- Membership Detection ---
 function detectMemberships(bodyText) {
   const orgs = [];
@@ -1325,6 +1521,7 @@ function generateDentalJsonLd(entities, pageUrl) {
     case 'service': return generateServicePageSchema(entities, pageUrl);
     case 'about': return generateAboutPageSchema(entities, pageUrl);
     case 'contact': return generateContactPageSchema(entities, pageUrl);
+    case 'blog': return generateBlogPostSchema(entities, pageUrl);
     default: return generateHomepageSchema(entities, pageUrl);
   }
 }
@@ -1381,8 +1578,8 @@ function buildDentistNode(entities, full = true) {
   if (practice.logo) {
     dentistNode.logo = { '@type': 'ImageObject', '@id': `${domain}/#logo`, 'url': practice.logo, 'contentUrl': practice.logo };
     dentistNode.image = { '@id': `${domain}/#logo` };
-  } else if (image) {
-    dentistNode.image = image;
+  } else {
+    dentistNode.image = image || `${domain}/logo.png`;
   }
 
   if (full) {
@@ -1424,14 +1621,12 @@ function buildPersonNodes(entities) {
   const { domain, doctors, services, practice } = entities;
   return doctors.map(dr => {
     const personNode = {
-      '@type': 'Physician',
+      '@type': 'Person',
       '@id': `${domain}/#/schema/person/${slugify(dr.name)}`,
-      'name': dr.name,
-      'medicalSpecialty': 'http://schema.org/Dentistry',
-      'worksFor': { '@id': `${domain}/#practice` }
+      'name': dr.name
     };
     if (dr.jobTitle) personNode.jobTitle = dr.jobTitle;
-    if (dr.url) personNode.url = dr.url;
+    personNode.url = dr.url || domain;
     if (practice.phone) personNode.telephone = practice.phone;
     if (dr.sameAs.length > 0) personNode.sameAs = dr.sameAs;
     if (dr.npi) personNode.identifier = { '@type': 'PropertyValue', 'propertyID': 'NPI', 'value': dr.npi };
@@ -1512,6 +1707,42 @@ function buildWebSiteNode(entities) {
   };
 }
 
+function buildVideoNodes(entities, pageUrl) {
+  if (!entities.videos || entities.videos.length === 0) return [];
+  const today = new Date().toISOString();
+  return entities.videos.map((vid, i) => {
+    const node = {
+      '@type': 'VideoObject',
+      '@id': `${pageUrl}/#video-${i + 1}`,
+      'name': vid.name || 'Video',
+      'description': vid.description || `Video from ${entities.practice?.name || 'this dental practice'}`,
+      'uploadDate': vid.uploadDate || today,
+      'thumbnailUrl': vid.thumbnailUrl || `${entities.domain}/video-thumbnail.jpg`
+    };
+    if (vid.contentUrl) node.contentUrl = vid.contentUrl;
+    if (vid.embedUrl) node.embedUrl = vid.embedUrl;
+    if (vid.duration) node.duration = vid.duration;
+    return node;
+  });
+}
+
+function buildHowToNode(entities, pageUrl) {
+  if (!entities.howToSteps || entities.howToSteps.length < 2) return null;
+  const serviceName = entities.serviceNameOverride || entities.h1 || 'Dental Procedure';
+  return {
+    '@type': 'HowTo',
+    '@id': `${pageUrl}/#howto`,
+    'name': `How ${serviceName} Works`,
+    'description': `Step-by-step process for ${serviceName.toLowerCase()} at ${entities.practice?.name || 'our dental practice'}.`,
+    'step': entities.howToSteps.map(s => ({
+      '@type': 'HowToStep',
+      'position': s.position,
+      'name': s.name,
+      'text': s.text
+    }))
+  };
+}
+
 function buildFaqNode(entities, pageUrl) {
   // Filter out any FAQs with empty, too-short, or junk answers
   const validFaqs = entities.faqs.filter(faq => {
@@ -1564,6 +1795,10 @@ function generateHomepageSchema(entities, pageUrl) {
 
   const breadcrumbNode = buildBreadcrumbNode(entities, pageUrl);
   if (breadcrumbNode) graph.push(breadcrumbNode);
+
+  // Video nodes
+  const videoNodes = buildVideoNodes(entities, pageUrl);
+  if (videoNodes.length > 0) graph.push(...videoNodes);
 
   return { '@context': 'https://schema.org', '@graph': graph };
 }
@@ -1647,7 +1882,7 @@ function generateServicePageSchema(entities, pageUrl) {
       }]
     };
   }
-  if (image) serviceNode.image = image;
+  serviceNode.image = image || `${domain}/logo.png`;
 
   graph.push(serviceNode);
 
@@ -1708,6 +1943,14 @@ function generateServicePageSchema(entities, pageUrl) {
   const reviewNodes = buildReviewNodes(entities, pageUrl);
   if (reviewNodes.length > 0) graph.push(...reviewNodes);
 
+  // 8. Video nodes
+  const videoNodes = buildVideoNodes(entities, pageUrl);
+  if (videoNodes.length > 0) graph.push(...videoNodes);
+
+  // 9. HowTo node (from detected step-by-step content)
+  const howToNode = buildHowToNode(entities, pageUrl);
+  if (howToNode) graph.push(howToNode);
+
   return { '@context': 'https://schema.org', '@graph': graph };
 }
 
@@ -1722,11 +1965,9 @@ function generateAboutPageSchema(entities, pageUrl) {
   // 2. Expanded Person nodes with E-E-A-T signals
   doctors.forEach(dr => {
     const personNode = {
-      '@type': ['Person', 'Dentist'],
+      '@type': 'Person',
       '@id': `${domain}/#/schema/person/${slugify(dr.name)}`,
       'name': dr.name,
-      'occupationalCategory': 'Dentist',
-      'worksFor': { '@id': `${domain}/#practice` },
       'hasOccupation': {
         '@type': 'Occupation',
         'name': 'Dentist',
@@ -1734,7 +1975,7 @@ function generateAboutPageSchema(entities, pageUrl) {
       }
     };
     if (dr.jobTitle) personNode.jobTitle = dr.jobTitle;
-    if (dr.url) personNode.url = dr.url;
+    personNode.url = dr.url || domain;
     if (dr.sameAs.length > 0) personNode.sameAs = dr.sameAs;
     if (dr.npi) personNode.identifier = { '@type': 'PropertyValue', 'propertyID': 'NPI', 'value': dr.npi };
     if (entities.services.length > 0) personNode.knowsAbout = entities.services.slice(0, 8).map(s => s.name);
@@ -1755,6 +1996,10 @@ function generateAboutPageSchema(entities, pageUrl) {
   if (faqNode) graph.push(faqNode);
   const breadcrumbNode = buildBreadcrumbNode(entities, pageUrl);
   if (breadcrumbNode) graph.push(breadcrumbNode);
+
+  // 5. Video nodes
+  const videoNodes = buildVideoNodes(entities, pageUrl);
+  if (videoNodes.length > 0) graph.push(...videoNodes);
 
   return { '@context': 'https://schema.org', '@graph': graph };
 }
@@ -1798,6 +2043,74 @@ function generateContactPageSchema(entities, pageUrl) {
   if (faqNode) graph.push(faqNode);
   const breadcrumbNode = buildBreadcrumbNode(entities, pageUrl);
   if (breadcrumbNode) graph.push(breadcrumbNode);
+
+  // 5. Video nodes
+  const videoNodes = buildVideoNodes(entities, pageUrl);
+  if (videoNodes.length > 0) graph.push(...videoNodes);
+
+  return { '@context': 'https://schema.org', '@graph': graph };
+}
+
+// ─── Blog Post Schema (Article / BlogPosting) ──────────────
+function generateBlogPostSchema(entities, pageUrl) {
+  const { domain, h1, description, doctors, articleData } = entities;
+  const graph = [];
+
+  // 1. BlogPosting / Article entity
+  const articleType = articleData?.type || 'BlogPosting';
+  const articleNode = {
+    '@type': articleType,
+    '@id': `${pageUrl}/#article`,
+    'headline': articleData?.headline || h1 || 'Blog Post',
+    'url': pageUrl,
+    'isPartOf': { '@id': `${domain}/#website` },
+    'mainEntityOfPage': { '@id': `${pageUrl}/#webpage` },
+    'publisher': { '@id': `${domain}/#practice` }
+  };
+  if (description) articleNode.description = truncateToSentence(description, 160);
+  if (articleData?.datePublished) articleNode.datePublished = articleData.datePublished;
+  if (articleData?.dateModified) articleNode.dateModified = articleData.dateModified;
+  if (articleData?.wordCount) articleNode.wordCount = articleData.wordCount;
+
+  // Author
+  if (articleData?.author) {
+    articleNode.author = { '@type': 'Person', 'name': articleData.author, 'url': pageUrl };
+  } else if (doctors.length > 0) {
+    articleNode.author = { '@id': `${domain}/#/schema/person/${slugify(doctors[0].name)}` };
+  }
+
+  // Image
+  articleNode.image = entities.image || `${domain}/logo.png`;
+
+  graph.push(articleNode);
+
+  // 2. Dentist node
+  const dentistNode = buildDentistNode(entities, true);
+  applyAggregateRating(dentistNode, entities);
+  graph.push(dentistNode);
+
+  // 3. Person nodes
+  graph.push(...buildPersonNodes(entities));
+
+  // 4. MedicalWebPage
+  const { pageNode, extraNodes } = buildWebPageNode(entities, pageUrl, 'blog');
+  pageNode.mainEntity = { '@id': `${pageUrl}/#article` };
+  graph.push(pageNode, ...extraNodes);
+
+  // 5. WebSite, FAQ, Breadcrumb
+  graph.push(buildWebSiteNode(entities));
+  const faqNode = buildFaqNode(entities, pageUrl);
+  if (faqNode) graph.push(faqNode);
+  const breadcrumbNode = buildBreadcrumbNode(entities, pageUrl);
+  if (breadcrumbNode) graph.push(breadcrumbNode);
+
+  // 6. Video nodes
+  const videoNodes = buildVideoNodes(entities, pageUrl);
+  if (videoNodes.length > 0) graph.push(...videoNodes);
+
+  // 7. HowTo node
+  const howToNode = buildHowToNode(entities, pageUrl);
+  if (howToNode) graph.push(howToNode);
 
   return { '@context': 'https://schema.org', '@graph': graph };
 }
@@ -2124,8 +2437,38 @@ function analyzeDentalGaps(entities, pageType) {
     });
   }
 
-  // Return top 4 (increased from 3 for more coverage)
-  return gaps.slice(0, 4);
+  // Video gap (all page types)
+  if (!entities.videos || entities.videos.length === 0) {
+    gaps.push({
+      priority: 'medium',
+      title: 'Add Patient Education Video',
+      description: 'No video content detected. Embed a YouTube or Vimeo video (office tour, procedure explanation, patient testimonial) to generate VideoObject schema — videos boost organic CTR and AI Overview inclusion.',
+      schema: '"@type": "VideoObject", "name": "...", "thumbnailUrl": "...", "contentUrl": "..."'
+    });
+  }
+
+  // Blog-specific gaps
+  if (pageType === 'blog') {
+    if (!entities.articleData || !entities.articleData.author) {
+      gaps.push({
+        priority: 'high',
+        title: 'Add Article Author (E-E-A-T)',
+        description: 'Blog post missing author attribution. Add a visible byline with the dentist\'s name — critical for medical E-E-A-T and BlogPosting schema.',
+        schema: '"author": { "@type": "Person", "name": "Dr. ..." }'
+      });
+    }
+    if (!entities.articleData || !entities.articleData.datePublished) {
+      gaps.push({
+        priority: 'high',
+        title: 'Add Publication Date',
+        description: 'No publication date detected. Add a visible date or <time datetime="..."> element — required for Article/BlogPosting schema.',
+        schema: '"datePublished": "2026-01-15"'
+      });
+    }
+  }
+
+  // Return top 6 for more coverage
+  return gaps.slice(0, 6);
 }
 
 // ─── Gemini AI Refinement Agent ────────────────────────────
@@ -2368,6 +2711,34 @@ function renderEntityCards(entities) {
       label: `Q${i + 1} `, value: truncate(f.question, 55), found: true
     }));
     entityCards.innerHTML += createEntityCard('❓', 'faq', 'FAQPage (AEO)', `${entities.faqs.length} Questions`, faqFields);
+  }
+
+  // Video Card
+  if (entities.videos && entities.videos.length > 0) {
+    const vidFields = entities.videos.slice(0, 4).map((v, i) => ({
+      label: `Video ${i + 1}`, value: truncate(v.name, 50), found: true
+    }));
+    entityCards.innerHTML += createEntityCard('🎬', 'video', 'VideoObject', `${entities.videos.length} Video${entities.videos.length > 1 ? 's' : ''}`, vidFields);
+  }
+
+  // Article / Blog Card
+  if (entities.articleData) {
+    const artFields = [
+      { label: 'Type', value: entities.articleData.type, found: true },
+      { label: 'Headline', value: truncate(entities.articleData.headline, 50), found: !!entities.articleData.headline },
+      { label: 'Author', value: entities.articleData.author, found: !!entities.articleData.author },
+      { label: 'Published', value: entities.articleData.datePublished ? formatDate(entities.articleData.datePublished) : null, found: !!entities.articleData.datePublished },
+      { label: 'Word Count', value: entities.articleData.wordCount ? `${entities.articleData.wordCount} words` : null, found: !!entities.articleData.wordCount },
+    ];
+    entityCards.innerHTML += createEntityCard('📝', 'article', 'Article / BlogPosting', truncate(entities.articleData.headline, 40), artFields);
+  }
+
+  // HowTo Card
+  if (entities.howToSteps && entities.howToSteps.length >= 2) {
+    const howFields = entities.howToSteps.slice(0, 4).map((s, i) => ({
+      label: `Step ${s.position}`, value: truncate(s.name, 50), found: true
+    }));
+    entityCards.innerHTML += createEntityCard('📋', 'howto', 'HowTo', `${entities.howToSteps.length} Steps`, howFields);
   }
 }
 
